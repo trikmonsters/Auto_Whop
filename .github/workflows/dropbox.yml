@@ -21,19 +21,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ffmpeg python3-pip
           pip3 install --break-system-packages gdown
-          curl -fsSL https://rclone.org/install.sh | sudo bash
-
-      - name: Configure rclone
-        env:
-          DROPBOX_TOKEN: ${{ secrets.DROPBOX_TOKEN }}
-        run: |
-          mkdir -p ~/.config/rclone
-
-          cat > ~/.config/rclone/rclone.conf <<EOF
-          [dropbox]
-          type = dropbox
-          token = ${DROPBOX_TOKEN}
-          EOF
 
       - name: Detect source
         env:
@@ -51,71 +38,316 @@ jobs:
       - name: Download Dropbox
         if: env.SOURCE == 'dropbox'
         env:
-          URL: ${{ inputs.url }}
+          DROPBOX_URL: ${{ inputs.url }}
+          DROPBOX_TOKEN: ${{ secrets.DROPBOX_TOKEN }}
         run: |
           mkdir -p input
 
-          python3 - "$URL" <<'PY'
+          python3 <<'PY'
+          import os
           import sys
-          from urllib.parse import urlparse, parse_qs, unquote
+          import json
+          import time
+          import requests
+          from urllib.parse import urlparse, parse_qs
 
-          url = sys.argv[1]
-          parsed = urlparse(url)
-          path = unquote(parsed.path)
+          URL = os.environ["DROPBOX_URL"]
+          TOKEN = os.environ["DROPBOX_TOKEN"]
 
-          if "/scl/fo/" in path:
-              print("Dropbox shared folder detected.")
-              print("Shared Dropbox folders require a Dropbox remote path.")
+          if not TOKEN:
+              print("DROPBOX_TOKEN is missing.")
               sys.exit(1)
 
-          if "/s/" in path:
-              print("Dropbox shared file detected.")
-              print("Direct shared links are not supported by rclone path mode.")
+          headers = {
+              "Authorization": f"Bearer {TOKEN}",
+              "Content-Type": "application/json"
+          }
+
+          def api(endpoint, payload=None):
+              url = f"https://api.dropboxapi.com/2/{endpoint}"
+
+              for attempt in range(1, 6):
+                  try:
+                      response = requests.post(
+                          url,
+                          headers=headers,
+                          json=payload or {},
+                          timeout=120
+                      )
+
+                      if response.status_code == 200:
+                          return response.json()
+
+                      if response.status_code in (429, 500, 502, 503, 504):
+                          print(
+                              f"Retryable error {response.status_code}, "
+                              f"attempt {attempt}/5"
+                          )
+                          time.sleep(attempt * 3)
+                          continue
+
+                      print(response.text)
+                      response.raise_for_status()
+
+                  except requests.RequestException as e:
+                      print(f"Request error: {e}")
+                      if attempt == 5:
+                          raise
+                      time.sleep(attempt * 3)
+
+              raise RuntimeError(f"API request failed: {endpoint}")
+
+          def content(endpoint, payload, output):
+              url = f"https://content.dropboxapi.com/2/{endpoint}"
+
+              for attempt in range(1, 6):
+                  try:
+                      arg = json.dumps(payload, separators=(",", ":"))
+
+                      request_headers = {
+                          "Authorization": f"Bearer {TOKEN}",
+                          "Dropbox-API-Arg": arg
+                      }
+
+                      response = requests.post(
+                          url,
+                          headers=request_headers,
+                          stream=True,
+                          timeout=120
+                      )
+
+                      if response.status_code == 200:
+                          with open(output, "wb") as f:
+                              for chunk in response.iter_content(
+                                  chunk_size=1024 * 1024
+                              ):
+                                  if chunk:
+                                      f.write(chunk)
+
+                          return
+
+                      if response.status_code in (429, 500, 502, 503, 504):
+                          print(
+                              f"Download retry {response.status_code}, "
+                              f"attempt {attempt}/5"
+                          )
+                          time.sleep(attempt * 3)
+                          continue
+
+                      print(response.text)
+                      response.raise_for_status()
+
+                  except requests.RequestException as e:
+                      print(f"Download error: {e}")
+                      if attempt == 5:
+                          raise
+                      time.sleep(attempt * 3)
+
+              raise RuntimeError(f"Download failed: {output}")
+
+          def shared_link(url):
+              result = api(
+                  "sharing/get_shared_link_file",
+                  {
+                      "url": url
+                  }
+              )
+
+              return result
+
+          def shared_link_metadata(url):
+              return api(
+                  "sharing/get_shared_link_metadata",
+                  {
+                      "url": url
+                  }
+              )
+
+          def download_shared_file(url, name):
+              output = os.path.join("input", name)
+
+              print(f"Downloading: {name}")
+
+              content(
+                  "sharing/get_shared_link_file",
+                  {
+                      "url": url
+                  },
+                  output
+              )
+
+              return output
+
+          def download_path(path, relative):
+              output = os.path.join("input", relative)
+
+              os.makedirs(
+                  os.path.dirname(output),
+                  exist_ok=True
+              )
+
+              print(f"Downloading: {path}")
+
+              content(
+                  "files/download",
+                  {
+                      "path": path
+                  },
+                  output
+              )
+
+          def process_entries(entries):
+              for entry in entries:
+                  tag = entry.get(".tag")
+                  path = entry.get("path_display", "")
+                  name = entry.get("name", "")
+
+                  if tag == "file":
+                      lower = name.lower()
+
+                      if lower.endswith((
+                          ".mp4",
+                          ".mov",
+                          ".mkv",
+                          ".webm",
+                          ".avi",
+                          ".m4v",
+                          ".wmv"
+                      )):
+                          relative = path.lstrip("/")
+
+                          download_path(
+                              path,
+                              relative
+                          )
+
+                  elif tag == "folder":
+                      folder_path = path
+
+                      result = api(
+                          "files/list_folder",
+                          {
+                              "path": folder_path,
+                              "recursive": False,
+                              "include_deleted": False
+                          }
+                      )
+
+                      process_entries(
+                          result.get("entries", [])
+                      )
+
+                      cursor = result.get("cursor")
+
+                      while result.get("has_more"):
+                          result = api(
+                              "files/list_folder/continue",
+                              {
+                                  "cursor": cursor
+                              }
+                          )
+
+                          process_entries(
+                              result.get("entries", [])
+                          )
+
+                          cursor = result.get("cursor")
+
+          print("Dropbox URL:")
+          print(URL)
+
+          metadata = shared_link_metadata(URL)
+
+          tag = metadata.get(".tag")
+
+          if tag == "file":
+              name = metadata.get("name", "video")
+
+              if name.lower().endswith((
+                  ".mp4",
+                  ".mov",
+                  ".mkv",
+                  ".webm",
+                  ".avi",
+                  ".m4v",
+                  ".wmv"
+              )):
+                  download_shared_file(
+                      URL,
+                      name
+                  )
+              else:
+                  print("Shared file is not a supported video.")
+                  sys.exit(1)
+
+          elif tag == "folder":
+              shared_path = metadata.get("path", "")
+
+              print("Shared Dropbox folder detected.")
+              print(f"Path: {shared_path}")
+
+              result = api(
+                  "sharing/list_folder",
+                  {
+                      "shared_link": {
+                          "url": URL
+                      }
+                  }
+              )
+
+              entries = result.get("entries", [])
+
+              def process_shared(entries):
+                  for entry in entries:
+                      tag = entry.get(".tag")
+                      name = entry.get("name", "")
+
+                      if tag == "file":
+                          if name.lower().endswith((
+                              ".mp4",
+                              ".mov",
+                              ".mkv",
+                              ".webm",
+                              ".avi",
+                              ".m4v",
+                              ".wmv"
+                          )):
+                              relative = name
+                              download_shared_file(
+                                  URL,
+                                  relative
+                              )
+
+                      elif tag == "folder":
+                          print(
+                              f"Nested folder detected: {name}"
+                          )
+
+              process_shared(entries)
+
+              cursor = result.get("cursor")
+
+              while result.get("has_more"):
+                  result = api(
+                      "sharing/list_folder/continue",
+                      {
+                          "cursor": cursor
+                      }
+                  )
+
+                  process_shared(
+                      result.get("entries", [])
+                  )
+
+                  cursor = result.get("cursor")
+
+          else:
+              print("Unsupported Dropbox shared link type.")
               sys.exit(1)
 
-          print(path)
+          print("")
+          print("Dropbox download completed.")
           PY
-
-          DROPBOX_PATH=$(python3 - "$URL" <<'PY'
-          import sys
-          from urllib.parse import urlparse, unquote
-
-          url = sys.argv[1]
-          parsed = urlparse(url)
-          path = unquote(parsed.path)
-
-          if "/home/" in path:
-              path = path.split("/home/", 1)[1]
-              path = "/" + path
-
-          print(path)
-          PY
-          )
-
-          rclone copy \
-            "dropbox:${DROPBOX_PATH}" \
-            ./input \
-            --include "*.mp4" \
-            --include "*.MP4" \
-            --include "*.mov" \
-            --include "*.MOV" \
-            --include "*.mkv" \
-            --include "*.MKV" \
-            --include "*.webm" \
-            --include "*.WEBM" \
-            --include "*.avi" \
-            --include "*.AVI" \
-            --include "*.m4v" \
-            --include "*.M4V" \
-            --include "*.wmv" \
-            --include "*.WMV" \
-            --transfers 4 \
-            --checkers 8 \
-            --retries 10 \
-            --low-level-retries 20 \
-            --retries-sleep 5s \
-            --stats 10s \
-            --progress
 
       - name: Download Google Drive
         if: env.SOURCE == 'google_drive'
@@ -125,43 +357,41 @@ jobs:
           mkdir -p input
 
           if [[ "$URL" == *"/folders/"* ]]; then
-            gdown "$URL" \
+            gdown \
+              "$URL" \
               --folder \
               --remaining-ok \
               -O input
           else
-            gdown "$URL" \
+            gdown \
+              "$URL" \
               -O input
           fi
 
-      - name: Filter videos
+      - name: Find videos
         run: |
-          mkdir -p videos
-
           find input -type f \
-            \( -iname "*.mp4" \
-            -o -iname "*.mov" \
-            -o -iname "*.mkv" \
-            -o -iname "*.webm" \
-            -o -iname "*.avi" \
-            -o -iname "*.m4v" \
-            -o -iname "*.wmv" \) \
-            -print0 |
-          while IFS= read -r -d '' file; do
-            relative="${file#input/}"
-            mkdir -p "videos/$(dirname "$relative")"
-            cp "$file" "videos/$relative"
-          done
+            \( \
+              -iname "*.mp4" \
+              -o -iname "*.mov" \
+              -o -iname "*.mkv" \
+              -o -iname "*.webm" \
+              -o -iname "*.avi" \
+              -o -iname "*.m4v" \
+              -o -iname "*.wmv" \
+            \) \
+            -print0 > videos.txt
 
-          find videos -type f -print
+          echo "Videos found:"
+          tr '\0' '\n' < videos.txt
 
-      - name: Process videos
+      - name: Compress videos
         run: |
           mkdir -p output
 
-          find videos -type f -print0 |
           while IFS= read -r -d '' input; do
-            relative="${input#videos/}"
+
+            relative="${input#input/}"
             directory="$(dirname "$relative")"
             filename="$(basename "$relative")"
             name="${filename%.*}"
@@ -183,7 +413,8 @@ jobs:
               -b:a 128k \
               -movflags +faststart \
               "output/$directory/${name}_compressed.mp4"
-          done
+
+          done < videos.txt
 
       - name: Create release
         env:
@@ -203,8 +434,12 @@ jobs:
         run: |
           TAG=$(cat release_tag)
 
-          find output -type f -name "*.mp4" -print0 |
+          find output \
+            -type f \
+            -name "*.mp4" \
+            -print0 |
           while IFS= read -r -d '' file; do
+
             size=$(stat -c%s "$file")
 
             if [ "$size" -gt 2147483648 ]; then
@@ -212,7 +447,10 @@ jobs:
               continue
             fi
 
-            gh release upload "$TAG" "$file"
+            gh release upload \
+              "$TAG" \
+              "$file"
+
           done
 
       - name: Summary
@@ -220,9 +458,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG=$(cat release_tag)
-          URL=$(gh release view "$TAG" --json url --jq '.url')
+
+          URL=$(gh release view "$TAG" \
+            --json url \
+            --jq '.url')
 
           echo "Release: $URL"
           echo ""
           echo "Processed files:"
-          find output -type f -name "*.mp4" -print
+          find output \
+            -type f \
+            -name "*.mp4" \
+            -print
