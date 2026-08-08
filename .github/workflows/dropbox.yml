@@ -1,10 +1,10 @@
-name: Dropbox Video Processor
+name: Cloud Video Processor
 
 on:
   workflow_dispatch:
     inputs:
-      dropbox_path:
-        description: "Dropbox path, e.g. /Videos or /Videos/example.mp4"
+      url:
+        description: "Dropbox or Google Drive file/folder URL"
         required: true
         type: string
 
@@ -19,7 +19,8 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          sudo apt-get install -y ffmpeg python3-pip
+          pip3 install --break-system-packages gdown
           curl -fsSL https://rclone.org/install.sh | sudo bash
 
       - name: Configure rclone
@@ -27,18 +28,73 @@ jobs:
           DROPBOX_TOKEN: ${{ secrets.DROPBOX_TOKEN }}
         run: |
           mkdir -p ~/.config/rclone
+
           cat > ~/.config/rclone/rclone.conf <<EOF
           [dropbox]
           type = dropbox
           token = ${DROPBOX_TOKEN}
           EOF
 
-      - name: Download videos
+      - name: Detect source
         env:
-          DROPBOX_PATH: ${{ inputs.dropbox_path }}
+          URL: ${{ inputs.url }}
+        run: |
+          if [[ "$URL" == *"dropbox.com"* ]]; then
+            echo "SOURCE=dropbox" >> "$GITHUB_ENV"
+          elif [[ "$URL" == *"drive.google.com"* ]] || [[ "$URL" == *"docs.google.com"* ]]; then
+            echo "SOURCE=google_drive" >> "$GITHUB_ENV"
+          else
+            echo "Unsupported URL"
+            exit 1
+          fi
+
+      - name: Download Dropbox
+        if: env.SOURCE == 'dropbox'
+        env:
+          URL: ${{ inputs.url }}
         run: |
           mkdir -p input
-          rclone copy "dropbox:${DROPBOX_PATH}" ./input \
+
+          python3 - "$URL" <<'PY'
+          import sys
+          from urllib.parse import urlparse, parse_qs, unquote
+
+          url = sys.argv[1]
+          parsed = urlparse(url)
+          path = unquote(parsed.path)
+
+          if "/scl/fo/" in path:
+              print("Dropbox shared folder detected.")
+              print("Shared Dropbox folders require a Dropbox remote path.")
+              sys.exit(1)
+
+          if "/s/" in path:
+              print("Dropbox shared file detected.")
+              print("Direct shared links are not supported by rclone path mode.")
+              sys.exit(1)
+
+          print(path)
+          PY
+
+          DROPBOX_PATH=$(python3 - "$URL" <<'PY'
+          import sys
+          from urllib.parse import urlparse, unquote
+
+          url = sys.argv[1]
+          parsed = urlparse(url)
+          path = unquote(parsed.path)
+
+          if "/home/" in path:
+              path = path.split("/home/", 1)[1]
+              path = "/" + path
+
+          print(path)
+          PY
+          )
+
+          rclone copy \
+            "dropbox:${DROPBOX_PATH}" \
+            ./input \
             --include "*.mp4" \
             --include "*.MP4" \
             --include "*.mov" \
@@ -61,9 +117,26 @@ jobs:
             --stats 10s \
             --progress
 
-      - name: Process videos
+      - name: Download Google Drive
+        if: env.SOURCE == 'google_drive'
+        env:
+          URL: ${{ inputs.url }}
         run: |
-          mkdir -p output
+          mkdir -p input
+
+          if [[ "$URL" == *"/folders/"* ]]; then
+            gdown "$URL" \
+              --folder \
+              --remaining-ok \
+              -O input
+          else
+            gdown "$URL" \
+              -O input
+          fi
+
+      - name: Filter videos
+        run: |
+          mkdir -p videos
 
           find input -type f \
             \( -iname "*.mp4" \
@@ -74,8 +147,21 @@ jobs:
             -o -iname "*.m4v" \
             -o -iname "*.wmv" \) \
             -print0 |
+          while IFS= read -r -d '' file; do
+            relative="${file#input/}"
+            mkdir -p "videos/$(dirname "$relative")"
+            cp "$file" "videos/$relative"
+          done
+
+          find videos -type f -print
+
+      - name: Process videos
+        run: |
+          mkdir -p output
+
+          find videos -type f -print0 |
           while IFS= read -r -d '' input; do
-            relative="${input#input/}"
+            relative="${input#videos/}"
             directory="$(dirname "$relative")"
             filename="$(basename "$relative")"
             name="${filename%.*}"
@@ -107,7 +193,7 @@ jobs:
 
           gh release create "$TAG" \
             --title "Processed Videos $TAG" \
-            --notes "Videos downloaded from Dropbox and compressed with FFmpeg."
+            --notes "Videos downloaded and compressed automatically."
 
           echo "$TAG" > release_tag
 
@@ -119,6 +205,13 @@ jobs:
 
           find output -type f -name "*.mp4" -print0 |
           while IFS= read -r -d '' file; do
+            size=$(stat -c%s "$file")
+
+            if [ "$size" -gt 2147483648 ]; then
+              echo "Skipping file larger than 2 GB: $file"
+              continue
+            fi
+
             gh release upload "$TAG" "$file"
           done
 
@@ -131,5 +224,5 @@ jobs:
 
           echo "Release: $URL"
           echo ""
-          echo "Files:"
+          echo "Processed files:"
           find output -type f -name "*.mp4" -print
