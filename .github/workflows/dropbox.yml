@@ -1,1 +1,135 @@
+name: Dropbox Video Processor
 
+on:
+  workflow_dispatch:
+    inputs:
+      dropbox_path:
+        description: "Dropbox path, e.g. /Videos or /Videos/example.mp4"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+
+      - name: Configure rclone
+        env:
+          DROPBOX_TOKEN: ${{ secrets.DROPBOX_TOKEN }}
+        run: |
+          mkdir -p ~/.config/rclone
+          cat > ~/.config/rclone/rclone.conf <<EOF
+          [dropbox]
+          type = dropbox
+          token = ${DROPBOX_TOKEN}
+          EOF
+
+      - name: Download videos
+        env:
+          DROPBOX_PATH: ${{ inputs.dropbox_path }}
+        run: |
+          mkdir -p input
+          rclone copy "dropbox:${DROPBOX_PATH}" ./input \
+            --include "*.mp4" \
+            --include "*.MP4" \
+            --include "*.mov" \
+            --include "*.MOV" \
+            --include "*.mkv" \
+            --include "*.MKV" \
+            --include "*.webm" \
+            --include "*.WEBM" \
+            --include "*.avi" \
+            --include "*.AVI" \
+            --include "*.m4v" \
+            --include "*.M4V" \
+            --include "*.wmv" \
+            --include "*.WMV" \
+            --transfers 4 \
+            --checkers 8 \
+            --retries 10 \
+            --low-level-retries 20 \
+            --retries-sleep 5s \
+            --stats 10s \
+            --progress
+
+      - name: Process videos
+        run: |
+          mkdir -p output
+
+          find input -type f \
+            \( -iname "*.mp4" \
+            -o -iname "*.mov" \
+            -o -iname "*.mkv" \
+            -o -iname "*.webm" \
+            -o -iname "*.avi" \
+            -o -iname "*.m4v" \
+            -o -iname "*.wmv" \) \
+            -print0 |
+          while IFS= read -r -d '' input; do
+            relative="${input#input/}"
+            directory="$(dirname "$relative")"
+            filename="$(basename "$relative")"
+            name="${filename%.*}"
+
+            mkdir -p "output/$directory"
+
+            ffmpeg \
+              -hide_banner \
+              -loglevel warning \
+              -y \
+              -i "$input" \
+              -map 0:v:0 \
+              -map 0:a? \
+              -c:v libx264 \
+              -preset faster \
+              -crf 28 \
+              -pix_fmt yuv420p \
+              -c:a aac \
+              -b:a 128k \
+              -movflags +faststart \
+              "output/$directory/${name}_compressed.mp4"
+          done
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="videos-$(date +'%Y%m%d-%H%M%S')"
+
+          gh release create "$TAG" \
+            --title "Processed Videos $TAG" \
+            --notes "Videos downloaded from Dropbox and compressed with FFmpeg."
+
+          echo "$TAG" > release_tag
+
+      - name: Upload videos
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG=$(cat release_tag)
+
+          find output -type f -name "*.mp4" -print0 |
+          while IFS= read -r -d '' file; do
+            gh release upload "$TAG" "$file"
+          done
+
+      - name: Summary
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG=$(cat release_tag)
+          URL=$(gh release view "$TAG" --json url --jq '.url')
+
+          echo "Release: $URL"
+          echo ""
+          echo "Files:"
+          find output -type f -name "*.mp4" -print
