@@ -492,7 +492,7 @@ jobs:
 
           done
 
-            - name: Summary
+      - name: Summary
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
